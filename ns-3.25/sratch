@@ -1,0 +1,584 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
+/*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation;
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ */
+
+//
+// Network topology
+//
+//           10Mb/s, 10ms       10Mb/s, 10ms
+//       n0-----------------n1-----------------n2
+//
+//
+// - Tracing of queues and packet receptions to file
+//   "tcp-large-transfer.tr"
+// - pcap traces also generated in the following files
+//   "tcp-large-transfer-$n-$i.pcap" where n and i represent node and interface
+// numbers respectively
+//  Usage (e.g.): ./waf --run tcp-large-transfer
+#include <ctype.h>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <cassert>
+#include <algorithm>
+
+#include "ns3/core-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+//#include "ns3/point-to-point-module.h"
+#include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/vlc-channel-helper.h"
+#include "ns3/vlc-device-helper.h"
+#include "ns3/netanim-module.h"
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE ("VisibleLightCommunication");
+
+void PrintPacketData(Ptr<const Packet> p, uint32_t size);
+
+//parameters configured by user
+uint16_t ap_num = 64, ue_num = 10;
+double Pmax = 4, Rmin = 15;
+/******************************/
+
+// The number of bytes to send in this simulation.
+static const uint32_t totalTxBytes = 80000;
+static uint32_t currentTxBytes = 0;
+
+// Perform series of 1040 byte writes (this is a multiple of 26 since
+// we want to detect data splicing in the output stream)
+static const uint32_t writeSize = 2048;
+uint8_t data[writeSize];
+
+NodeContainer ap ,ue; //"Container"-type objects are not compatible with ns3 smart pointer objects
+VlcDeviceHelper devHelper;
+
+struct Resource{
+	double power;
+	double rate;
+	
+	double ch_gain;
+	double multiplier_p, multiplier_r; //multiplier for power constraint and QoS constraint
+};
+
+//AP para
+double bias = 0,semi_angle = 35, azimuth = 0 , elevation = 180.0, gain = 70;
+
+//UE para
+double filter_gain = 1, refractive_index = 1.5, fov = 28.5,
+		concentration_gain = 0,
+		rxgain = 0, beta = 1;
+double PhotoDetectorArea = (1.3e-5); 	// to set the photo dectror area
+double Band_factor_Noise_Signal = (10.0);
+double bw = 3 * 1e5, A = 1.3e-5, temp = 295;
+uint16_t servPort = 4000;
+
+// These are for starting the writing process, and handling the sending
+// socket's notification upcalls (events).  These two together more or less
+// implement a sending "Application", although not a proper ns3::Application
+// subclass.
+
+void StartFlow(Ptr<Socket>, Ipv4Address, uint16_t);
+
+void WriteUntilBufferFull(Ptr<Socket>, uint32_t);
+
+std::vector<double> Received(1, 0);
+std::vector<double> theTime(1, 0);
+//////////////////////////////////////
+//Function to generate signals.
+//std::vector<double>& GenerateSignal(int size, double dutyRatio);
+
+static void RxEnd(Ptr<const Packet> p) { // used for tracing and calculating throughput
+
+	//PrintPacketData(p,p->GetSize());
+
+	Received.push_back(Received.back() + p->GetSize()); // appends on the received packet to the received data up until that packet and adds that total to the end of the vector
+	theTime.push_back(Simulator::Now().GetSeconds()); // keeps track of the time during simulation that a packet is received
+	//NS_LOG_UNCOND("helooooooooooooooooo RxEnd");
+}
+
+static void TxEnd(Ptr<const Packet> p) { // also used as a trace and for calculating throughput
+
+	Received.push_back(Received.back() + p->GetSize()); // same as for the RxEnd trace
+	theTime.push_back(Simulator::Now().GetSeconds()); 	//
+	//NS_LOG_UNCOND("helooooooooooooooooo TxEnd");
+}
+
+static void CwndTracer(uint32_t oldval, uint32_t newval) {
+	NS_LOG_INFO("Moving cwnd from " << oldval << " to " << newval);
+}
+
+
+void ApConfig();
+void UeConfig();
+
+std::vector<std::vector<double>> CreateChannelMatrix();
+std::map<uint16_t, uint16_t> UserAssociation();
+std::map<uint16_t, Resource> PowerAllocation(std::map<uint8_t, uint8_t> association);
+std::map<uint16_t, Resource> ResourceAllocAlgo();
+std::vector<Ptr < Socket >> DataTransmission(std::map<uint16_t, Resource> resource,
+		std::map<std::string, Ipv4InterfaceContainer> &ipInterfs);
+void StartSimulation(std::map<std::string, Ipv4InterfaceContainer> ipInterfs,
+		std::vector<Ptr < Socket >> localsockets);
+
+double EstimatedNoiseVar(double power);
+bool Dinkelbach(std::map<NodeContainer, Resource> resource, double lambda);
+
+int main(int argc, char *argv[]) {
+	// Users may find it convenient to turn on explicit debugging
+	// for selected modules; the below lines suggest how to do this
+	//  LogComponentEnable("TcpL4Protocol", LOG_LEVEL_ALL);
+	//  LogComponentEnable("TcpSocketImpl", LOG_LEVEL_ALL);
+	LogComponentEnable("PacketSink", LOG_LEVEL_ALL);
+	//  LogComponentEnable("TcpLargeTransfer", LOG_LEVEL_ALL);
+
+	CommandLine cmd;
+	cmd.Parse(argc, argv);
+
+	// initialize the tx buffer.
+	for (uint32_t i = 0; i < writeSize; ++i) {
+		char m = toascii(97 + i % 26);
+		data[i] = m;
+	}
+
+	/*Configure APs and UEs*/
+	
+	ap.Create(ap_num);
+	ue.Create(ue_num);
+	
+	ApConfig();
+	UeConfig();
+
+	std::map<uint16_t, Resource> resource =  ResourceAllocAlgo();
+
+	std::map<std::string, Ipv4InterfaceContainer> ipInterfs;
+	std::vector<Ptr < Socket >> localsockets = DataTransmission(resource, ipInterfs);
+
+	// ...and schedule the sending "Application"; This is similar to what an
+	// ns3::Application subclass would do internally.
+
+	/* One can toggle the comment for the following line on or off to see the
+	 effects of finite send buffer modelling.  One can also change the size of
+	 said buffer.*/
+	//localSocket->SetAttribute("SndBufSize", UintegerValue(4096));
+	/*Ask for ASCII and pcap traces of network traffic*/
+	AsciiTraceHelper ascii;
+	// p2p.EnableAsciiAll (ascii.CreateFileStream ("tcp-large-transfer.tr"));
+	//p2p.EnablePcapAll ("tcp-large-transfer");
+
+	/* Finally, set up the simulator to run.  The 1000 second hard limit is a
+	 failsafe in case some change above causes the simulation to never end*/
+	/*AnimationInterface anim("visible-light-communication.xml");
+
+	Simulator::Stop(Seconds(100.0));
+	Simulator::Run();
+
+	double throughput = ((Received.back() * 8)) / theTime.back(); //goodput calculation
+	std::cout << "throughput value is " << throughput << std::endl;
+
+	Ptr < VlcRxNetDevice > rxHandle = devHelper.GetReceiver(
+			"THE_RECEIVER1");
+	double goodput = rxHandle->ComputeGoodPut();
+       std::cout<< "Good Packet Received Size is  "<< goodput<< std::endl;
+	goodput *= 8;
+	goodput /= theTime.back();
+	goodput /= 1024;
+	std::cout << "Simulation time is "<< theTime.back()<<std::endl;
+	std::cout << "goodput value is " << goodput << std::endl;
+	//std::cout << chHelper.GetChannelSNR("THE_CHANNEL2") << "\t" << std::endl;
+
+	//NS_LOG_UNCOND(throughput);
+
+	//std::cout<<throughput<<std::endl;
+
+	Received.clear();
+
+	Simulator::Destroy();
+	currentTxBytes = 0;*/
+
+	//Output plot graph
+}
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+//begin implementation of sending "Application"
+void StartFlow(Ptr<Socket> localSocket, Ipv4Address servAddress,
+		uint16_t servPort) {
+	//NS_LOG_UNCOND("helooooooooooooooooo StartFlow");
+	localSocket->Connect(InetSocketAddress(servAddress, servPort)); //connect
+
+	// tell the tcp implementation to call WriteUntilBufferFull again
+	// if we blocked and new tx buffer space becomes available
+	localSocket->SetSendCallback(MakeCallback(&WriteUntilBufferFull));
+	WriteUntilBufferFull(localSocket, localSocket->GetTxAvailable());
+}
+
+void WriteUntilBufferFull(Ptr<Socket> localSocket, uint32_t txSpace) {
+	//NS_LOG_UNCOND("helooooooooooooooooo WriteUntilBufferFull");
+	while (currentTxBytes < totalTxBytes && localSocket->GetTxAvailable() > 0) {
+
+		uint32_t left = totalTxBytes - currentTxBytes;
+		uint32_t dataOffset = currentTxBytes % writeSize;
+		uint32_t toWrite = writeSize - dataOffset;
+		toWrite = std::min (toWrite, left);
+		toWrite = std::min (toWrite, localSocket->GetTxAvailable ());
+
+		Ptr<Packet> p = Create<Packet>(&data[dataOffset], toWrite);
+		Ptr<Node> startingNode = localSocket->GetNode();
+		Ptr<VlcTxNetDevice> txOne = DynamicCast<VlcTxNetDevice>(startingNode->GetDevice(0) );
+		txOne->EnqueueDataPacket(p);
+
+		int amountSent = localSocket->Send (&data[dataOffset], toWrite, 0);
+		if(amountSent < 0)
+		{
+			// we will be called again when new tx space becomes available.
+			return;
+		}
+
+		currentTxBytes += amountSent;
+	}
+
+	localSocket->Close();
+	currentTxBytes = 0; //newly added
+}
+
+void PrintPacketData(Ptr<const Packet> p, uint32_t size) {
+	uint8_t *data = new uint8_t[size];
+
+	p->CopyData(data, size);
+
+	for (uint32_t i = 0; i < size; i++) {
+		std::cout << (int) data[i] << " ";
+	}
+
+	std::cout << std::endl;
+
+	delete[] data;
+
+}
+
+void ApConfig(){
+
+	MobilityHelper mobility;
+	Ptr < ListPositionAllocator > m_listPosition_ap = CreateObject<
+			ListPositionAllocator>();
+	//room size: 15m x 15m x 8m
+	//APs are located uniformly distributed
+	for(double width = 1.0; width <= sqrt(ap_num); width++) { //to be modified
+		for(double length = 1.0; length <= sqrt(ap_num); length++) {
+			m_listPosition_ap->Add(Vector(15/9*length, 15/9*width, 3.0));
+		}
+	}
+	mobility.SetPositionAllocator(m_listPosition_ap);
+	mobility.SetMobilityModel("ns3::VlcMobilityModel");
+	mobility.Install(ap);
+
+	/*Set parameters for each AP and UE*/
+
+	for(uint16_t ap_i = 0; ap_i < ap_num; ap_i++) {
+		std::string devName = std::to_string(ap_i); //should enable C++11
+		devHelper.CreateTransmitter(devName);
+		devHelper.SetTrasmitterParameter(devName, "pMax",Pmax*2);
+		devHelper.SetTrasmitterParameter(devName, "Bias", bias);//SETTING BIAS VOLTAGE MOVES THE SIGNAL VALUES BY THE AMOUNT OF BIASING
+		devHelper.SetTrasmitterParameter(devName, "SemiAngle", semi_angle);
+		devHelper.SetTrasmitterParameter(devName, "Azimuth", azimuth);
+		devHelper.SetTrasmitterParameter(devName, "Elevation",elevation);
+		devHelper.SetTrasmitterParameter(devName, "Gain", gain);
+		devHelper.SetTrasmitterPosition(devName, m_listPosition_ap->GetPosition(ap_i));
+
+		//ap.Get(ap_i)->AddDevice(devHelper.GetTransmitter(devName));
+	}
+}
+
+void UeConfig(){
+	MobilityHelper mobility;
+	Ptr < ListPositionAllocator > m_listPosition_ue = CreateObject<
+			ListPositionAllocator>();
+
+	//UEs are located randomly
+	double min_bound = 0.0, max_bound = 15.0;
+	for(uint16_t i = 0; i < ue_num; i++) {
+		double ue_pos[2];
+		for(uint16_t j = 0; j < 2; j++){
+			Ptr<UniformRandomVariable> pos = CreateObject<UniformRandomVariable> ();
+			pos->SetAttribute("Min", DoubleValue(min_bound));
+			pos->SetAttribute("Max", DoubleValue(max_bound));
+			ue_pos[j] = pos->GetValue();
+		}
+		m_listPosition_ue->Add(Vector(ue_pos[0], ue_pos[1], 0.0));
+	}
+	mobility.SetPositionAllocator(m_listPosition_ue);
+	mobility.SetMobilityModel("ns3::VlcMobilityModel");
+	mobility.Install(ue);
+
+	for(uint16_t ue_i = 0; ue_i < ue_num; ue_i ++) {
+		std::string devName = std::to_string(ue_i); //should enable C++11
+		devHelper.CreateReceiver(devName);
+		devHelper.SetReceiverParameter(devName, "FilterGain", filter_gain);
+		devHelper.SetReceiverParameter(devName, "RefractiveIndex", refractive_index);
+		devHelper.SetReceiverParameter(devName, "FOVAngle", fov);
+		devHelper.SetReceiverParameter(devName, "ConcentrationGain", concentration_gain);
+		devHelper.SetReceiverParameter(devName, "PhotoDetectorArea", A);
+		devHelper.SetReceiverParameter(devName, "RXGain", rxgain);
+		devHelper.SetReceiverParameter(devName, "Beta", beta);
+		/****************************************MODULATION SCHEME SETTINGS******************
+		*AVILABLE MODULATION SCHEMES ARE: [1]. VlcErrorModel::PAM4, [2]. VlcErrorModel::OOK [3]. VlcErrorModel::VPPM
+		*AVILABLE MODULATION SCHEMES [4]. VlcErrorModel::PSK4 [5]. VlcErrorModel::PSK16. [6]. VlcErrorModel::QAM4 [7]. VlcErrorModel::QAM16.
+		************************************************************************************/
+		devHelper.SetReceiverParameter(devName, "SetModulationScheme",VlcErrorModel::PSK16);
+		//devHelper.SetReceiverParameter(devName, "DutyCycle", 0.85);
+		devHelper.SetReceiverPosition(devName, m_listPosition_ue->GetPosition(ue_i));
+
+		//ue.Get(ue_i)->AddDevice(devHelper.GetReceiver(devName));
+	}
+}
+
+std::vector<std::vector<double>> CreateChannelMatrix() {
+	//Initialize the channel matrix
+	std::vector<std::vector<double>> channel_matrix;
+	channel_matrix.resize(ue_num, std::vector<double>(ap_num, 0));
+
+	for(uint16_t ue_i = 0; ue_i < ue_num; ue_i++) {
+		for(uint16_t ap_i = 0; ap_i < ap_num; ap_i++) {
+			std::string apDevName = std::to_string(ap_i), ueDevName =
+					std::to_string(ue_i);
+			double dist = CalculateDistance(devHelper.GetTransmitter(apDevName)->GetPosition(),
+					devHelper.GetReceiver(ueDevName)->GetPosition());
+			double TxGain = devHelper.GetTransmitter(apDevName)->GetTXGain();
+			double RxGain = devHelper.GetReceiver(ueDevName)->GetRXGain();
+			double cGain = devHelper.GetReceiver(ueDevName)->GetConcentrationGain();
+			double ch_gain = TxGain * RxGain * filter_gain *
+							cGain * A /
+							std::pow(dist, 2);
+			channel_matrix[ue_i][ap_i] = ch_gain;
+		}
+	}
+
+	return channel_matrix;
+}
+
+std::map<uint16_t, uint16_t> UserAssociation() {
+	/*Central unit execute the RA algorithm*/
+	//AP-UE pairing
+	std::vector<std::vector<double>> channel_matrix = CreateChannelMatrix();
+
+	std::map<uint16_t, uint16_t> association;
+
+	//Each UE associate an AP which provides the best channel condition for it
+	for(uint16_t ue_i = 0; ue_i < ue_num; ue_i++) {
+		double max_gain = channel_matrix[ue_i][0];
+		uint16_t candidate = 0;
+
+		for(uint16_t ap_i = 1; ap_i < ap_num; ap_i++) {
+			if(channel_matrix[ue_i][ap_i] > max_gain){
+				max_gain = channel_matrix[ue_i][ap_i];
+				candidate = ap_i;
+			}
+		}
+		association.insert(std::pair<uint16_t, uint16_t>(ue_i, candidate));
+	}
+
+	//Constraint that each AP can serve only one UE
+	for(uint16_t i = 0; i < ue_num; i++) {
+		for(uint16_t j = i+1; j < ue_num; j++) {
+			if(association[i] == association[j]) {
+				if(channel_matrix[i][association[i]] <
+						channel_matrix[j][association[j]]){
+					association.erase(i);
+					break;
+				}
+				else {
+					association.erase(j);
+				}
+			}
+		}
+	}
+
+	
+
+
+	return association;
+}
+
+std::map<uint16_t, Resource> PowerAllocation(std::map<uint16_t, uint16_t> association) {
+	std::map<uint16_t, Resource> resource; //first index represents the ID of UE in an association
+	std::vector<std::vector<double>> channel_matrix = CreateChannelMatrix();
+	//init
+	for(uint16_t ue_i = 0; ue_i < ue_num; ue_i++) {
+		resource[ue_i].power = Pmax;
+		resource[ue_i].rate = Rmin;
+		uint16_t ap_i = association[ue_i];
+		resource[ue_i].ch_gain = channel_matrix[ue_i][ap_i];
+
+	}
+	//PA algorithm
+
+	//Allocate power
+	for(std::map<uint16_t, Resource>::iterator it = resource.begin(); it!=resource.end(); ++it) {
+		std::string devName = std::to_string(association[it->first]);
+		/****************************************TX-SIGNAL************************************
+		* 1000-SIGNAL SIZE, 0.5-DUTY RATIO, 0-BIAS, 9.25E-5-PEAK VOLTAGE, 0-MINIMUM VOLTAGE
+		************************************************************************************/
+		devHelper.SetTXSignal(devName, 1000, 0.5, 0, it->second.power * 2, 0);
+		devHelper.SetTrasmitterParameter(devName, "DataRateInMBPS", it->second.rate);
+	}
+	return resource;
+
+}
+
+std::map<uint16_t, Resource> ResourceAllocAlgo() {
+	std::map<uint16_t, uint16_t> association = UserAssociation();
+	std::map<uint16_t, Resource> resource = PowerAllocation(association);
+	return resource;
+}
+
+std::vector<Ptr < Socket >> DataTransmission(std::map<uint16_t, Resource> resource,
+		std::map<std::string, Ipv4InterfaceContainer> &ipInterfs) {
+	//Establish channels
+	double wl_low = 380, wl_high = 780, delay = 0;
+	// Now add ip/tcp stack to all nodes.
+
+	std::map<std::string, NetDeviceContainer> dev;
+
+	std::vector<Ptr < Socket >> localsockets;
+
+	VlcChannelHelper chHelper;
+	ApplicationContainer apps;
+
+	for(std::map<uint16_t, Resource>::iterator it = resource.begin(); it!=resource.end(); it++) {
+		int ue_i = it->first, ap_i = it->second;
+		std::string chName = "ch" + std::to_string(ue_i) + "-" + std::to_string(ap_i),
+				apName = std::to_string(ap_i), ueName = std::to_string(ue_i);
+		chHelper.CreateChannel(chName);
+		chHelper.SetPropagationLoss(chName, "VlcPropagationLoss");
+		chHelper.SetPropagationDelay(chName, delay);
+		chHelper.AttachTransmitter(chName, apName, &devHelper);
+		chHelper.AttachReceiver(chName, ueName, &devHelper);
+		chHelper.SetChannelParameter(chName, "TEMP", temp);
+		chHelper.SetChannelParameter(chName, "BAND_FACTOR_NOISE_SIGNAL",Band_factor_Noise_Signal );
+		chHelper.SetChannelWavelength(chName, wl_low, wl_high);
+		chHelper.SetChannelParameter(chName, "ElectricNoiseBandWidth",bw);
+		// And then install devices and channels connecting our topology.
+		dev[chName] = chHelper.Install(ap.Get(ap_i), ue.Get(ue_i),
+				&devHelper, &chHelper, apName, ueName, chName);
+
+		InternetStackHelper internet;
+		internet.InstallAll();
+
+		// Later, we add IP addresses.
+		Ipv4AddressHelper ipv4;
+		std::ostringstream subnet;
+		subnet << "10.1." << ue_i + 1 << ".0";
+		ipv4.SetBase(subnet.str().c_str(), "255.255.255.0");
+		ipInterfs[chName] = ipv4.Assign(dev[chName]);
+
+		// and setup ip routing tables to get total ip-level connectivity.
+			Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+		///////////////////////////////////////////////////////////////////////////
+		// Simulation 1
+		//
+		// Send 2000000 bytes over a connection to server port 50000 at time 0
+		// Should observe SYN exchange, a lot of data segments and ACKS, and FIN
+		// exchange.  FIN exchange isn't quite compliant with TCP spec (see release
+		// notes for more info)
+		//
+		///////////////////////////////////////////////////////////////////////////
+
+		// Create a packet sink to receive these packets on n2...
+		PacketSinkHelper sink("ns3::TcpSocketFactory",
+				InetSocketAddress(Ipv4Address::GetAny(), servPort));
+
+		apps.Add(sink.Install(ue.Get(ue_i)));
+
+		// Create a source to send packets from n0.  Instead of a full Application
+		// and the helper APIs you might see in other example files, this example
+		// will use sockets directly and register some socket callbacks as a sending
+		// "Application".
+		// Create and bind the socket...
+		Ptr < Socket > localSocket = Socket::CreateSocket(ap.Get(ap_i),
+				TcpSocketFactory::GetTypeId());
+		localSocket->Bind();
+		localsockets.push_back(localSocket);
+
+		// Trace changes to the congestion window
+		Config::ConnectWithoutContext(
+				"/NodeList/0/$ns3::TcpL4Protocol/SocketList/0/CongestionWindow",
+				MakeCallback(&CwndTracer));
+		dev[chName].Get(1)->TraceConnectWithoutContext("PhyRxEnd", MakeCallback(&RxEnd)); //traces to allow us to see what and when data is sent through the network
+		dev[chName].Get(1)->TraceConnectWithoutContext("PhyTxEnd", MakeCallback(&TxEnd)); //traces to allow us to see what and when data is received through the network
+		}
+
+	apps.Start(Seconds(0.0));
+	apps.Stop(Seconds(4.0));
+
+	return localsockets;
+}
+
+void StartSimulation(std::map<std::string, Ipv4InterfaceContainer> ipInterfs,
+		std::vector<Ptr < Socket >> localsockets){
+	std::map<std::string, Ipv4InterfaceContainer>::iterator i =
+			ipInterfs.begin();
+	std::vector<Ptr < Socket >>::iterator j = localsockets.begin();
+	for(; i != ipInterfs.end() && j != localsockets.end();
+			++i && ++j){
+		Simulator::ScheduleNow(&StartFlow, *j, i->second.GetAddress(1),
+				servPort);
+	}
+
+}
+
+double EstimatedNoiseVar(double power) {
+		//res = IntegralRes() / IntegralPlanck();
+		double res = 0.2;
+
+		const double q = 1.602176487e-19;	//electronic charge [Coulombs]
+		const double k = 1.38064852e-23;	//Boltzmann constant [m^2 kg s^-2 K^-1]
+		const double I2 = 0.5620; //noise bandwidth factor
+		double I3 = 0.0868; //noise bandwidth factor
+		double Ib = 1.134e-6; //photocurrent due to background radiation [microA]
+		double Gol = 10; //open-loop voltage gain
+		double Cpd = 1.12e-10; //fixed capacitance of photodetector per unit area [pF/m^2]
+		double gm = 30e-3; //FET transconductance [mS]
+		double gamma = 1.5; //FET channel noise factor
+
+		double shot_var, thermal_var;
+
+		// shot noise variance
+		shot_var = (2 * q * res * power * bw) + (2 * q * Ib * I2 * bw);
+
+		// thermal noise variance
+		thermal_var = (8 * M_PI * k * temp * Cpd * A * I2 * (std::pow(bw, 2)) / Gol)
+				+ (16 * (std::pow(M_PI, 2)) * k * temp * gamma * (std::pow(Cpd, 2))
+						* (std::pow(A, 2)) * I3 * (std::pow(bw, 3)) / gm);
+
+		return (shot_var + thermal_var);
+}
+
+bool Dinkelbach(std::map<int, Resource> ra, double lambda) {
+	const double xi = 1e-4;
+	double power_sum = 0, rate_sum = 0;
+	for(std::map<int, Resource>::iterator it = ra.begin(); it != ra.end(); ++it) {
+		power_sum += it->second.power;
+		rate_sum += it->second.rate;
+	}
+
+	return (rate_sum - lambda * power_sum < xi);
+}
+
